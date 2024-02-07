@@ -1,0 +1,1 @@
+for %%i in (*.m2v) do ffmpeg -i %%i -brand mp42 -c:a pcm_s16le -ar 41000 -b:v 16M output.mp4
