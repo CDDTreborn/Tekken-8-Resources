@@ -1,0 +1,192 @@
+import bpy
+from mathutils import Matrix, Vector
+
+def get_bone_hierarchy_order(bone):
+    """Recursively get the bone hierarchy in order."""
+    bones = [bone]
+    for child in bone.children:
+        bones.extend(get_bone_hierarchy_order(child))
+    return bones
+
+def get_bones_in_hierarchy_order(armature):
+    """Get all bones in the armature in hierarchy order, starting from the roots."""
+    bones_order = []
+    for bone in armature.pose.bones:
+        if bone.parent is None:  # Start with root bones
+            bones_order.extend(get_bone_hierarchy_order(bone))
+    return [bone.name for bone in bones_order]
+
+def calculate_scale_difference(source_bone, target_bone):
+    """
+    Calculate the scale difference between the source and target bones.
+    Returns a scale vector representing the difference.
+    """
+    # Get the length of the source and target bones
+    source_length = (source_bone.tail - source_bone.head).length
+    target_length = (target_bone.tail - target_bone.head).length
+
+    # Avoid division by zero
+    if target_length == 0:
+        return Vector((1, 1, 1))
+
+    # Calculate the scale difference
+    scale_factor = source_length / target_length
+    return Vector((scale_factor, scale_factor, scale_factor))
+
+def match_bone_transform(active_bone, selected_bone, active_world_matrix, selected_world_matrix):
+    """
+    Match the transform of the selected bone to the active bone.
+    This includes location, rotation, and scale.
+    """
+    # Calculate the scale difference between the source and destination bones
+    scale_diff = calculate_scale_difference(active_bone.bone, selected_bone.bone)
+
+    # Get the active bone's rest matrix in world space
+    active_rest_matrix = active_world_matrix @ active_bone.bone.matrix_local
+
+    # Convert the active bone's rest matrix to the selected bone's local space
+    selected_rest_matrix = selected_world_matrix.inverted() @ active_rest_matrix
+
+    # Apply the scale difference to the selected bone's matrix
+    selected_rest_matrix @= Matrix.Scale(scale_diff[0], 4, Vector((1, 0, 0)))  # Scale X
+    selected_rest_matrix @= Matrix.Scale(scale_diff[1], 4, Vector((0, 1, 0)))  # Scale Y
+    selected_rest_matrix @= Matrix.Scale(scale_diff[2], 4, Vector((0, 0, 1)))  # Scale Z
+
+    # Apply the transform to the selected bone's pose
+    selected_bone.matrix = selected_rest_matrix
+
+def store_bone_connections(armature):
+    """Store the connection status of all bones in the armature."""
+    connections = {}
+    # Switch to Edit Mode to access EditBone properties
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='EDIT')
+    for bone in armature.data.edit_bones:
+        connections[bone.name] = bone.use_connect
+    # Switch back to Object Mode
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return connections
+
+def restore_bone_connections(armature, connections):
+    """Restore the connection status of all bones in the armature."""
+    # Switch to Edit Mode to modify EditBone properties
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='EDIT')
+    for bone in armature.data.edit_bones:
+        if bone.name in connections:
+            bone.use_connect = connections[bone.name]
+    # Switch back to Object Mode
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+def process_bones_in_order(active_armature, selected_armature, bone_names):
+    """
+    Process the bones in the specified order and match their transforms.
+    """
+    for bone_name in bone_names:
+        active_bone = active_armature.pose.bones.get(bone_name)
+        selected_bone = selected_armature.pose.bones.get(bone_name)
+        
+        if active_bone and selected_bone:
+            # Get the world matrix of the active and selected armatures
+            active_world_matrix = active_armature.matrix_world
+            selected_world_matrix = selected_armature.matrix_world
+            
+            # Match the bone transform
+            match_bone_transform(active_bone, selected_bone, active_world_matrix, selected_world_matrix)
+            
+            # Update the scene to reflect the changes for each bone
+            bpy.context.view_layer.update()
+
+class RigMatchingOperator(bpy.types.Operator):
+    bl_idname = "object.match_armature"
+    bl_label = "Match Armature Pose"
+    bl_description = "Matches the pose of the selected armature to the active armature's rest pose"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # Get the source and destination rigs from the scene properties
+        source_rig = context.scene.source_rig
+        destination_rig = context.scene.destination_rig
+
+        # Error handling: Check if both rigs are selected
+        if not source_rig or not destination_rig:
+            self.report({'ERROR'}, "Please select both source and destination rigs.")
+            return {'CANCELLED'}
+
+        # Ensure both rigs are armatures
+        if source_rig.type != 'ARMATURE' or destination_rig.type != 'ARMATURE':
+            self.report({'ERROR'}, "Both selected objects must be armatures.")
+            return {'CANCELLED'}
+
+        # Store the connection status of the destination rig's bones
+        bone_connections = store_bone_connections(destination_rig)
+
+        # Temporarily disconnect all bones in the destination rig
+        bpy.context.view_layer.objects.active = destination_rig
+        bpy.ops.object.mode_set(mode='EDIT')
+        for bone in destination_rig.data.edit_bones:
+            bone.use_connect = False
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Ensure both rigs are in pose mode
+        bpy.context.view_layer.objects.active = source_rig
+        bpy.ops.object.mode_set(mode='POSE')
+        bpy.context.view_layer.objects.active = destination_rig
+        bpy.ops.object.mode_set(mode='POSE')
+
+        # Get bones in the source rig in hierarchy order
+        bones_in_order = get_bones_in_hierarchy_order(source_rig)
+
+        # Check for mismatched bones
+        mismatched_bones = []
+        for bone_name in bones_in_order:
+            if bone_name not in destination_rig.pose.bones:
+                mismatched_bones.append(bone_name)
+
+        if mismatched_bones:
+            self.report({'WARNING'}, f"Mismatched bones: {', '.join(mismatched_bones)}")
+
+        # Process the bones in the order determined by the hierarchy
+        process_bones_in_order(source_rig, destination_rig, bones_in_order)
+
+        # Restore the connection status of the destination rig's bones
+        restore_bone_connections(destination_rig, bone_connections)
+
+        # Final scene update to ensure all changes are reflected
+        bpy.context.view_layer.update()
+
+        self.report({'INFO'}, "Pose matching complete!")
+        return {'FINISHED'}
+
+class RigMatchingPanel(bpy.types.Panel):
+    bl_label = "Match Rig Pose"
+    bl_idname = "VIEW3D_PT_rig_matching"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Tool"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        # Source rig selector
+        layout.prop_search(scene, "source_rig", scene, "objects", text="Source Rig")
+        # Destination rig selector
+        layout.prop_search(scene, "destination_rig", scene, "objects", text="Destination Rig")
+        # Match button
+        layout.operator("object.match_armature", text="Match Pose")
+
+def register():
+    bpy.utils.register_class(RigMatchingOperator)
+    bpy.utils.register_class(RigMatchingPanel)
+    bpy.types.Scene.source_rig = bpy.props.PointerProperty(type=bpy.types.Object, name="Source Rig")
+    bpy.types.Scene.destination_rig = bpy.props.PointerProperty(type=bpy.types.Object, name="Destination Rig")
+
+def unregister():
+    bpy.utils.unregister_class(RigMatchingOperator)
+    bpy.utils.unregister_class(RigMatchingPanel)
+    del bpy.types.Scene.source_rig
+    del bpy.types.Scene.destination_rig
+
+if __name__ == "__main__":
+    register()
